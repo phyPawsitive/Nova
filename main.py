@@ -10,7 +10,7 @@
 # To get you started we've included code to prevent your Battlesnake from moving backwards.
 # For more info see docs.battlesnake.com
 
-import random
+import time
 import typing
 from collections import deque
 
@@ -191,82 +191,277 @@ def _nearest_food_distance(
     return min(reachable) if reachable else None
 
 
+# --- Lookahead search -------------------------------------------------------
+#
+# Everything above this line scores a single position. Everything below runs
+# Minimax with alpha-beta pruning (iterative deepening, time-boxed to the
+# game's move timeout) on top of that scoring, so moves account for how the
+# territory fight actually plays out a few rounds ahead instead of assuming
+# opponents freeze in place. Search is "Paranoid": every opponent is treated
+# as a single adversary picking its worst-case combined move against us,
+# which is the standard simplification of N-player Minimax (the alternative,
+# MaxN, has each opponent selfishly optimize for itself instead).
+#
+# To keep branching bounded when more than two snakes are alive, only the
+# two nearest opponents are simulated as active adversaries; farther-away
+# snakes are held in place turn-by-turn (still blocking cells, just not
+# considered as an active threat) rather than fully game-tree-searched.
+
+TIME_BUDGET_FLOOR_SECONDS = 0.05
+TIME_BUDGET_SAFETY_MARGIN_SECONDS = 0.15
+MAX_ACTIVE_OPPONENTS = 2
+MAX_SEARCH_ROUNDS = 12
+
+
+class _TimeUp(Exception):
+    pass
+
+
+def _build_sim_state(board: typing.Dict) -> typing.Dict:
+    return {
+        "width": board["width"],
+        "height": board["height"],
+        "food": {(f["x"], f["y"]) for f in board["food"]},
+        "snakes": {
+            snake["id"]: {
+                "body": _body_coords(snake),
+                "health": snake["health"],
+                "alive": True,
+            }
+            for snake in board["snakes"]
+        },
+    }
+
+
+def _sim_state_to_board(sim_state: typing.Dict) -> typing.Dict:
+    return {
+        "width": sim_state["width"],
+        "height": sim_state["height"],
+        "food": [{"x": x, "y": y} for x, y in sim_state["food"]],
+        "snakes": [
+            {"id": sid, "body": [{"x": x, "y": y} for x, y in snake["body"]]}
+            for sid, snake in sim_state["snakes"].items()
+            if snake["alive"]
+        ],
+    }
+
+
+def _legal_moves_for(sim_state: typing.Dict, snake_id: str) -> typing.List[str]:
+    head = sim_state["snakes"][snake_id]["body"][0]
+    width, height = sim_state["width"], sim_state["height"]
+    moves = [
+        direction
+        for direction, (dx, dy) in DIRECTIONS.items()
+        if _in_bounds((head[0] + dx, head[1] + dy), width, height)
+    ]
+    return moves or ["up"]  # boxed in on all sides; must still return something
+
+
+def _apply_moves(
+    sim_state: typing.Dict, moves: typing.Dict[str, Coord], frozen_ids: typing.FrozenSet[str]
+) -> typing.Dict:
+    """Advance every snake one turn given its chosen (dx, dy), then resolve
+    eliminations (walls, starvation, body collisions, head-to-heads) the way
+    the Battlesnake rules engine does. Frozen or already-dead snakes are
+    copied through unchanged, acting as static obstacles for this round.
+    """
+    width, height = sim_state["width"], sim_state["height"]
+    new_snakes: typing.Dict[str, typing.Dict] = {}
+    new_heads: typing.Dict[str, Coord] = {}
+
+    for sid, snake in sim_state["snakes"].items():
+        if not snake["alive"] or sid in frozen_ids:
+            new_snakes[sid] = snake
+            continue
+        dx, dy = moves[sid]
+        head = snake["body"][0]
+        new_head = (head[0] + dx, head[1] + dy)
+        ate = new_head in sim_state["food"]
+        new_body = [new_head] + (snake["body"] if ate else snake["body"][:-1])
+        new_snakes[sid] = {
+            "body": new_body,
+            "health": 100 if ate else snake["health"] - 1,
+            "alive": True,
+        }
+        new_heads[sid] = new_head
+
+    eaten = {new_snakes[sid]["body"][0] for sid in new_heads if new_snakes[sid]["body"][0] in sim_state["food"]}
+    new_food = sim_state["food"] - eaten
+
+    for sid, head in new_heads.items():
+        snake = new_snakes[sid]
+        if not _in_bounds(head, width, height) or snake["health"] <= 0:
+            snake["alive"] = False
+            continue
+        if any(head in other["body"][1:] for other in new_snakes.values()):
+            snake["alive"] = False
+            continue
+        for other_sid, other in new_snakes.items():
+            if other_sid != sid and other["body"][0] == head:
+                if len(other["body"]) >= len(snake["body"]):
+                    snake["alive"] = False
+                break
+
+    return {"width": width, "height": height, "food": new_food, "snakes": new_snakes}
+
+
+def _evaluate(sim_state: typing.Dict, my_id: str) -> float:
+    snake = sim_state["snakes"].get(my_id)
+    if snake is None or not snake["alive"]:
+        return -100000.0
+
+    opponents_alive = [s for sid, s in sim_state["snakes"].items() if sid != my_id and s["alive"]]
+    if not opponents_alive:
+        return 100000.0
+
+    board = _sim_state_to_board(sim_state)
+    my_head = snake["body"][0]
+    my_length = len(snake["body"])
+
+    score = 2 * _territory_score(my_head, board, my_id)
+
+    blocked = _blocked_cells(board)
+    blocked.discard(my_head)
+    space = _flood_fill_size(my_head, blocked, sim_state["width"], sim_state["height"], cap=my_length * 2 + 5)
+    if space < my_length:
+        score -= 500 * (my_length - space)
+
+    if snake["health"] < 50:
+        food_dist = _nearest_food_distance(my_head, board, blocked)
+        if food_dist is not None:
+            score += max(0, 20 - food_dist)
+
+    score += 0.5 * my_length
+    return score
+
+
+def _paranoid_search(
+    sim_state: typing.Dict,
+    my_id: str,
+    active_agents: typing.List[str],
+    frozen_ids: typing.FrozenSet[str],
+    depth: int,
+    alpha: float,
+    beta: float,
+    moves_so_far: typing.Dict[str, Coord],
+    agent_idx: int,
+    deadline: float,
+) -> float:
+    """One round of Paranoid Minimax: every agent in active_agents (us first,
+    then each active opponent) picks a move maximizing (us) or minimizing
+    (them) the eventual score, in turn, against the same pre-round state.
+    Once everyone has chosen, the round is applied and we recurse.
+    """
+    if time.perf_counter() > deadline:
+        raise _TimeUp()
+
+    if agent_idx == len(active_agents):
+        next_state = _apply_moves(sim_state, moves_so_far, frozen_ids)
+        return _minimax_round(next_state, my_id, active_agents, frozen_ids, depth - 1, alpha, beta, deadline)
+
+    agent_id = active_agents[agent_idx]
+    snake = sim_state["snakes"][agent_id]
+    if not snake["alive"]:
+        return _paranoid_search(
+            sim_state, my_id, active_agents, frozen_ids, depth, alpha, beta, moves_so_far, agent_idx + 1, deadline
+        )
+
+    maximizing = agent_id == my_id
+    best = float("-inf") if maximizing else float("inf")
+    for direction in _legal_moves_for(sim_state, agent_id):
+        moves_so_far[agent_id] = DIRECTIONS[direction]
+        value = _paranoid_search(
+            sim_state, my_id, active_agents, frozen_ids, depth, alpha, beta, moves_so_far, agent_idx + 1, deadline
+        )
+        if maximizing:
+            best = max(best, value)
+            alpha = max(alpha, best)
+        else:
+            best = min(best, value)
+            beta = min(beta, best)
+        if alpha >= beta:
+            break
+    return best
+
+
+def _minimax_round(
+    sim_state: typing.Dict,
+    my_id: str,
+    active_agents: typing.List[str],
+    frozen_ids: typing.FrozenSet[str],
+    depth: int,
+    alpha: float,
+    beta: float,
+    deadline: float,
+) -> float:
+    my_snake = sim_state["snakes"].get(my_id)
+    if my_snake is None or not my_snake["alive"] or depth <= 0:
+        return _evaluate(sim_state, my_id)
+    if not any(sim_state["snakes"][a]["alive"] for a in active_agents if a != my_id):
+        return _evaluate(sim_state, my_id)
+    return _paranoid_search(sim_state, my_id, active_agents, frozen_ids, depth, alpha, beta, {}, 0, deadline)
+
+
+def _choose_active_agents(sim_state: typing.Dict, my_id: str) -> typing.Tuple[typing.List[str], typing.FrozenSet[str]]:
+    my_head = sim_state["snakes"][my_id]["body"][0]
+    living_opponents = [sid for sid, s in sim_state["snakes"].items() if sid != my_id and s["alive"]]
+    living_opponents.sort(
+        key=lambda sid: abs(sim_state["snakes"][sid]["body"][0][0] - my_head[0])
+        + abs(sim_state["snakes"][sid]["body"][0][1] - my_head[1])
+    )
+    active = living_opponents[:MAX_ACTIVE_OPPONENTS]
+    frozen = frozenset(living_opponents[MAX_ACTIVE_OPPONENTS:])
+    return [my_id] + active, frozen
+
+
+def _search_best_move(sim_state: typing.Dict, my_id: str, deadline: float) -> typing.Tuple[typing.Optional[str], float]:
+    active_agents, frozen_ids = _choose_active_agents(sim_state, my_id)
+
+    best_direction = None
+    best_score = float("-inf")
+    depth = 1
+    while True:
+        try:
+            alpha, beta = float("-inf"), float("inf")
+            round_best_direction, round_best_score = None, float("-inf")
+            for direction in _legal_moves_for(sim_state, my_id):
+                moves = {my_id: DIRECTIONS[direction]}
+                value = _paranoid_search(
+                    sim_state, my_id, active_agents, frozen_ids, depth, alpha, beta, moves, 1, deadline
+                )
+                if value > round_best_score:
+                    round_best_score, round_best_direction = value, direction
+                alpha = max(alpha, round_best_score)
+        except _TimeUp:
+            break
+
+        best_direction, best_score = round_best_direction, round_best_score
+        depth += 1
+        if depth > MAX_SEARCH_ROUNDS or time.perf_counter() > deadline:
+            break
+
+    return best_direction, best_score
+
+
 # move is called on every turn and returns your next move
 # Valid moves are "up", "down", "left", or "right"
 # See https://docs.battlesnake.com/api/example-move for available data
 def move(game_state: typing.Dict) -> typing.Dict:
-    you = game_state["you"]
     board = game_state["board"]
-    width, height = board["width"], board["height"]
+    my_id = game_state["you"]["id"]
 
-    my_id = you["id"]
-    my_head = (you["body"][0]["x"], you["body"][0]["y"])
-    my_length = len(you["body"])
-    my_health = you["health"]
+    timeout_ms = game_state.get("game", {}).get("timeout", 500)
+    time_budget = max(TIME_BUDGET_FLOOR_SECONDS, timeout_ms / 1000.0 - TIME_BUDGET_SAFETY_MARGIN_SECONDS)
+    deadline = time.perf_counter() + time_budget
 
-    blocked = _blocked_cells(board)
+    sim_state = _build_sim_state(board)
+    chosen, score = _search_best_move(sim_state, my_id, deadline)
 
-    opponents = [s for s in board["snakes"] if s["id"] != my_id]
-    opponent_heads = {(s["body"][0]["x"], s["body"][0]["y"]): len(s["body"]) for s in opponents}
-
-    # Hard filter: walls, snake bodies, and our own neck are guaranteed
-    # death, never worth considering.
-    safe_moves = []
-    for direction, (dx, dy) in DIRECTIONS.items():
-        cell = (my_head[0] + dx, my_head[1] + dy)
-        if not _in_bounds(cell, width, height):
-            continue
-        if cell in blocked:
-            continue
-        safe_moves.append((direction, cell))
-
-    if not safe_moves:
+    if chosen is None:
         print(f"MOVE {game_state['turn']}: No safe moves detected! Moving down")
         return {"move": "down"}
 
-    scored_moves = []
-    for direction, cell in safe_moves:
-        score = 0.0
-
-        # Soft filter: a cell next to an opponent's head is only a guaranteed
-        # loss if they're equal or longer (equal length still kills us both).
-        # Against a shorter opponent, the same square is bait -- we win the
-        # head-to-head, so reward it instead.
-        risky = False
-        for ohead, olen in opponent_heads.items():
-            if cell in set(_neighbors(ohead)):
-                if olen >= my_length:
-                    risky = True
-                else:
-                    score += 5
-        if risky:
-            score -= 1000
-
-        # Don't walk into a pocket smaller than our own body, no matter how
-        # much open board it looks like it leads to right now.
-        space = _flood_fill_size(cell, blocked, width, height, cap=my_length * 2 + 5)
-        if space < my_length:
-            score -= 500 * (my_length - space)
-
-        # Core counter-strategy: fight for contested territory (Voronoi)
-        # rather than just maximizing our own reachable area.
-        score += 2 * _territory_score(cell, board, my_id)
-
-        # Only chase food once health matters; otherwise keep prioritizing
-        # board control, since Hobbs-style bots lean on space, not hunger.
-        if my_health < 50:
-            food_dist = _nearest_food_distance(cell, board, blocked)
-            if food_dist is not None:
-                score += max(0, 20 - food_dist)
-
-        scored_moves.append((score, direction))
-
-    scored_moves.sort(key=lambda t: t[0], reverse=True)
-    best_score = scored_moves[0][0]
-    best_moves = [d for s, d in scored_moves if s == best_score]
-    chosen = random.choice(best_moves)
-
-    print(f"MOVE {game_state['turn']}: {chosen} (score={best_score})")
+    print(f"MOVE {game_state['turn']}: {chosen} (score={score})")
     return {"move": chosen}
 
 
